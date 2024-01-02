@@ -24,6 +24,7 @@ class VisionGANDataset(Dataset[torch.Tensor]):
         self.images = list(
             map(lambda x: os.path.join(images_folder, x), os.listdir(images_folder))
         )
+        
         self.transform = v2.Compose(
             [
                 v2.ToDtype(torch.get_default_dtype(), scale=True),
@@ -390,7 +391,9 @@ def main(filename: str, checkpoints_folder: str = "./checkpoints"):
 
     if not os.path.exists(checkpoints_folder):
         os.mkdir(checkpoints_folder)
-
+    
+    models = [generator_A, generator_B, discriminator_A, discriminator_B, generator_loss, discriminator_loss, buffer_A, buffer_B]
+    
     (
         generator_A,
         generator_B,
@@ -409,14 +412,7 @@ def main(filename: str, checkpoints_folder: str = "./checkpoints"):
     ) = cast(
         Any,
         accelerator.prepare(
-            generator_A,
-            generator_B,
-            discriminator_A,
-            discriminator_B,
-            generator_loss,
-            discriminator_loss,
-            buffer_A,
-            buffer_B,
+            *[model.to(memory_format=torch.channels_last) for model in models],
             generator_optimizer,
             discriminator_optimizer,
             train_dataloader_A,
@@ -441,7 +437,7 @@ def main(filename: str, checkpoints_folder: str = "./checkpoints"):
     discriminator_scheduler: optim.lr_scheduler.LRScheduler
 
     NumberOfDatapoints = min(len(train_dataloader_A), len(train_dataloader_B))
-
+    
     for epoch in range(1, epochs + 1):
         accelerator.print(f"== EPOCH: {epoch}/{epochs} ==")
         gen_losses = torch.zeros(1, device=device)
@@ -449,6 +445,8 @@ def main(filename: str, checkpoints_folder: str = "./checkpoints"):
         x_A: torch.Tensor
         x_B: torch.Tensor
         for x_A, x_B in zip(train_dataloader_A, train_dataloader_B):
+            x_A = x_A.to(memory_format=torch.channels_last)
+            x_B = x_B.to(memory_format=torch.channels_last)
             # Generate images
             fake_A: torch.Tensor = generator_A(x_B)
             fake_B: torch.Tensor = generator_B(x_A)

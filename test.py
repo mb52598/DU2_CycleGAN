@@ -9,8 +9,8 @@ train_dataset_B = VisionGANDataset('./horse2zebra/trainB')
 generator_A = Resnet_k(9)
 generator_B = Resnet_k(9)
 
-generator_A.load_state_dict({k.lstrip('_orig_mod.'): v for k, v in safetensors.torch.load_file('./checkpoints/generator_A_20.safetensors').items()})
-generator_B.load_state_dict({k.lstrip('_orig_mod.'): v for k, v in safetensors.torch.load_file('./checkpoints/generator_B_20.safetensors').items()})
+generator_A.load_state_dict({k.lstrip('_orig_mod.'): v for k, v in safetensors.torch.load_file('./checkpoints/generator_A_40.safetensors').items()})
+generator_B.load_state_dict({k.lstrip('_orig_mod.'): v for k, v in safetensors.torch.load_file('./checkpoints/generator_B_40.safetensors').items()})
 
 index = random.randint(0, min(len(train_dataset_A), len(train_dataset_B)) - 1)
 
