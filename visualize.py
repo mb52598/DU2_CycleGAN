@@ -1,6 +1,8 @@
 import os
 import random
 import safetensors.torch
+import matplotlib
+from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
 from main import VisionGANDataset, Resnet_k, get_inverse_transform
 
@@ -13,6 +15,8 @@ def get_state_dict(checkpoint_file: str):
 
 
 def visualize_results(dataset_path: str, checkpoints_folder: str = "./checkpoints"):
+    matplotlib.use('Agg')
+
     train_dataset_A = VisionGANDataset(os.path.join(dataset_path, "trainA"))
     train_dataset_B = VisionGANDataset(os.path.join(dataset_path, "trainB"))
 
@@ -21,16 +25,14 @@ def visualize_results(dataset_path: str, checkpoints_folder: str = "./checkpoint
 
     inv_transform = get_inverse_transform()
 
+    fig: Figure
     ax0: plt.Axes
     ax1: plt.Axes
     ax2: plt.Axes
     ax3: plt.Axes
-    _, ((ax0, ax1), (ax2, ax3)) = plt.subplots(2, 2)
-    ax0.set_title("Real")
-    ax1.set_title("Fake")
 
     for checkpoint_epoch in sorted(
-        set(map(lambda x: x.rsplit("_", 1)[1], os.listdir(checkpoints_folder)))
+        set(map(lambda x: x.rsplit("_", 1)[1], os.listdir(checkpoints_folder))), reverse=True, key=lambda x: int(x)
     ):
         index = random.randint(0, min(len(train_dataset_A), len(train_dataset_B)) - 1)
         real_B = train_dataset_B[index]
@@ -57,6 +59,11 @@ def visualize_results(dataset_path: str, checkpoints_folder: str = "./checkpoint
             )
         )
 
+        fig, ((ax0, ax1), (ax2, ax3)) = plt.subplots(2, 2)
+        ax0.set_title("Real")
+        ax1.set_title("Fake")
+
+        fig.suptitle(checkpoint_epoch)
         ax0.imshow(inv_transform(real_B).permute(1, 2, 0))
         ax1.imshow(inv_transform(fake_A).permute(1, 2, 0))
         ax2.imshow(inv_transform(real_A).permute(1, 2, 0))

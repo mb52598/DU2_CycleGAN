@@ -220,7 +220,7 @@ def UNet_encoder(in_k: int, out_k: int, batch_norm: bool = True):
     return nn.Sequential(
         nn.Conv2d(in_k, out_k, kernel_size=4, stride=2),
         *((nn.BatchNorm2d(out_k),) if batch_norm else ()),
-        nn.LeakyReLU(0.2, inplace=True),
+        nn.LeakyReLU(negative_slope=0.2, inplace=True),
     )
 
 
@@ -253,7 +253,7 @@ class UNet(nn.Module):
         self.e7 = UNet_encoder(512, 512)
         self.bottleneck = nn.Sequential(
             nn.Conv2d(512, 512, kernel_size=4, stride=2, padding="same"),
-            nn.ReLU(),
+            nn.ReLU(inplace=True),
         )
         self.d1 = UNet_decoder(1024, 512)
         self.d2 = UNet_decoder(1024, 512)
@@ -357,10 +357,20 @@ class GeneratorLoss(nn.Module):
         loss_identity_B = nnF.l1_loss(g_B_x_B, x_B)
         loss_cyc_A = nnF.l1_loss(g_B_fake_A, x_B)
         loss_cyc_B = nnF.l1_loss(g_A_fake_B, x_A)
-        return 36 * (loss_gan_A + loss_gan_B) + 196_608 * self.lambda_param * (
-            loss_cyc_A
-            + loss_cyc_B
-            + self.lambda_ident * (loss_identity_A + loss_identity_B)
+        # return 36 * (loss_gan_A + loss_gan_B) + 196_608 * self.lambda_param * (
+        #     loss_cyc_A
+        #     + loss_cyc_B
+        #     + self.lambda_ident * (loss_identity_A + loss_identity_B)
+        # )
+        return (
+            loss_gan_A
+            + loss_gan_B
+            + self.lambda_param
+            * (
+                loss_cyc_A
+                + loss_cyc_B
+                + self.lambda_ident * (loss_identity_A + loss_identity_B)
+            )
         )
 
 
@@ -396,11 +406,17 @@ class DiscriminatorLoss(nn.Module):
         loss_real_B = nnF.mse_loss(d_B_x_B, self.tensor_1)
         loss_fake_A = nnF.mse_loss(d_A_fakes_A, self.tensor_0)
         loss_fake_B = nnF.mse_loss(d_B_fakes_B, self.tensor_0)
-        return 18 * (loss_real_A + loss_real_B + loss_fake_A + loss_fake_B)
+        # return 18 * (loss_real_A + loss_real_B + loss_fake_A + loss_fake_B)
+        return 0.5 * (loss_real_A + loss_real_B + loss_fake_A + loss_fake_B)
+
+
+def custom_collate(data: list[torch.Tensor]) -> torch.Tensor:
+    return torch.stack(data).to(memory_format=torch.channels_last)
 
 
 def main(filename: str, checkpoints_folder: str = "./checkpoints"):
     torch.backends.cudnn.benchmark = True
+    # torch.multiprocessing.set_start_method("spawn")
 
     lr = 0.0002
     batch_size = 1
@@ -418,8 +434,18 @@ def main(filename: str, checkpoints_folder: str = "./checkpoints"):
     ) as train_dataset_A, FullVisionGANDataset(
         "./horse2zebra/trainB", device
     ) as train_dataset_B:
-        train_dataloader_A = DataLoader(train_dataset_A, batch_size, shuffle=True)
-        train_dataloader_B = DataLoader(train_dataset_B, batch_size, shuffle=True)
+        train_dataloader_A = DataLoader(
+            train_dataset_A,
+            batch_size,
+            shuffle=True,
+            collate_fn=custom_collate
+        )
+        train_dataloader_B = DataLoader(
+            train_dataset_B,
+            batch_size,
+            shuffle=True,
+            collate_fn=custom_collate
+        )
 
         generator_A = Resnet_k(9)
         generator_B = Resnet_k(9)
@@ -443,11 +469,21 @@ def main(filename: str, checkpoints_folder: str = "./checkpoints"):
             betas=(0.5, 0.999),
         )
 
-        generator_scheduler = optim.lr_scheduler.LinearLR(
-            generator_optimizer, start_factor=1, end_factor=0, total_iters=100
+        def lambda_rule(epoch: int):
+            lr_l = 1.0 - max(0, epoch + 1 - 100) / float(100 + 1)
+            return lr_l
+
+        # generator_scheduler = optim.lr_scheduler.LinearLR(
+        #     generator_optimizer, start_factor=1, end_factor=0, total_iters=100
+        # )
+        # discriminator_scheduler = optim.lr_scheduler.LinearLR(
+        #     discriminator_optimizer, start_factor=1, end_factor=0, total_iters=100
+        # )
+        generator_scheduler = optim.lr_scheduler.LambdaLR(
+            generator_optimizer, lambda_rule
         )
-        discriminator_scheduler = optim.lr_scheduler.LinearLR(
-            discriminator_optimizer, start_factor=1, end_factor=0, total_iters=100
+        discriminator_scheduler = optim.lr_scheduler.LambdaLR(
+            discriminator_optimizer, lambda_rule
         )
 
         if not os.path.exists(checkpoints_folder):
@@ -506,7 +542,10 @@ def main(filename: str, checkpoints_folder: str = "./checkpoints"):
         generator_scheduler: optim.lr_scheduler.LRScheduler
         discriminator_scheduler: optim.lr_scheduler.LRScheduler
 
-        NumberOfDatapoints = min(len(train_dataloader_A), len(train_dataloader_B))
+        data_count = min(len(train_dataloader_A), len(train_dataloader_B))
+
+        generator_A.train()
+        generator_B.train()
 
         for epoch in range(1, epochs + 1):
             accelerator.print(f"== EPOCH: {epoch}/{epochs} ==")
@@ -515,8 +554,6 @@ def main(filename: str, checkpoints_folder: str = "./checkpoints"):
             x_A: torch.Tensor
             x_B: torch.Tensor
             for x_A, x_B in tqdm.tqdm(zip(train_dataloader_A, train_dataloader_B)):
-                x_A = x_A.to(memory_format=torch.channels_last)
-                x_B = x_B.to(memory_format=torch.channels_last)
                 # Generate images
                 fake_A: torch.Tensor = generator_A(x_B)
                 fake_B: torch.Tensor = generator_B(x_A)
@@ -574,12 +611,8 @@ def main(filename: str, checkpoints_folder: str = "./checkpoints"):
                     discriminator_B,
                     os.path.join(checkpoints_folder, f"discriminator_B_{epoch}"),
                 )
-            accelerator.print(
-                "Generator loss: ", (gen_losses / NumberOfDatapoints).item()
-            )
-            accelerator.print(
-                "Discriminator loss: ", (disc_losses / NumberOfDatapoints).item()
-            )
+            accelerator.print("Generator loss: ", (gen_losses / data_count).item())
+            accelerator.print("Discriminator loss: ", (disc_losses / data_count).item())
 
 
 if __name__ == "__main__":
