@@ -10,8 +10,8 @@ from torch.utils.data import DataLoader, Dataset
 import torchvision
 from torchvision.transforms import v2
 import safetensors
-from accelerate import Accelerator
-from typing import Any, cast
+import safetensors.torch
+from typing import Any
 
 
 def get_transform_params():
@@ -108,6 +108,7 @@ class FullVisionGANDataset(Dataset[torch.Tensor]):
         pass
 
     def __len__(self) -> int:
+        return 100
         return len(self.tensors)
 
     def __getitem__(self, index: int) -> torch.Tensor:
@@ -416,7 +417,6 @@ def custom_collate(data: list[torch.Tensor]) -> torch.Tensor:
 
 def main(filename: str, checkpoints_folder: str = "./checkpoints"):
     torch.backends.cudnn.benchmark = True
-    # torch.multiprocessing.set_start_method("spawn")
 
     lr = 0.0002
     batch_size = 1
@@ -424,10 +424,14 @@ def main(filename: str, checkpoints_folder: str = "./checkpoints"):
     lambda_param = 10
     lambda_ident = 0.5
     buffer_size = 50
-
-    accelerator = Accelerator(step_scheduler_with_optimizer=False)
-    device = cast(torch.device, accelerator.device)
-    # device_str = device.type + ":" + str(device.index or 0)
+    autocast_dtype = torch.float16
+    
+    if not torch.cuda.is_available():
+        print('gtfo')
+        exit()
+    if torch.cuda.device_count() > 1:
+        print("You have multiple cuda devices available, count: ", torch.cuda.device_count())
+    device = torch.device("cuda", torch.cuda.current_device())
 
     with FullVisionGANDataset(
         "./horse2zebra/trainA", device
@@ -435,28 +439,22 @@ def main(filename: str, checkpoints_folder: str = "./checkpoints"):
         "./horse2zebra/trainB", device
     ) as train_dataset_B:
         train_dataloader_A = DataLoader(
-            train_dataset_A,
-            batch_size,
-            shuffle=True,
-            collate_fn=custom_collate
+            train_dataset_A, batch_size, shuffle=True, collate_fn=custom_collate
         )
         train_dataloader_B = DataLoader(
-            train_dataset_B,
-            batch_size,
-            shuffle=True,
-            collate_fn=custom_collate
+            train_dataset_B, batch_size, shuffle=True, collate_fn=custom_collate
         )
 
-        generator_A = Resnet_k(9)
-        generator_B = Resnet_k(9)
-        discriminator_A = PatchGAN()
-        discriminator_B = PatchGAN()
+        generator_A = Resnet_k(9).to(device)
+        generator_B = Resnet_k(9).to(device)
+        discriminator_A = PatchGAN().to(device)
+        discriminator_B = PatchGAN().to(device)
 
-        generator_loss = GeneratorLoss(lambda_param, lambda_ident)
-        discriminator_loss = DiscriminatorLoss(buffer_size)
+        generator_loss = GeneratorLoss(lambda_param, lambda_ident).to(device)
+        discriminator_loss = DiscriminatorLoss(buffer_size).to(device)
 
-        buffer_A = ImageBufferUltraFast(buffer_size, 3, 256, 256)
-        buffer_B = ImageBufferUltraFast(buffer_size, 3, 256, 256)
+        buffer_A = ImageBufferUltraFast(buffer_size, 3, 256, 256).to(device)
+        buffer_B = ImageBufferUltraFast(buffer_size, 3, 256, 256).to(device)
 
         generator_optimizer = optim.Adam(
             itertools.chain(generator_A.parameters(), generator_B.parameters()),
@@ -489,130 +487,88 @@ def main(filename: str, checkpoints_folder: str = "./checkpoints"):
         if not os.path.exists(checkpoints_folder):
             os.mkdir(checkpoints_folder)
 
-        models = [
-            generator_A,
-            generator_B,
-            discriminator_A,
-            discriminator_B,
-            generator_loss,
-            discriminator_loss,
-            buffer_A,
-            buffer_B,
-        ]
-
-        (
-            generator_A,
-            generator_B,
-            discriminator_A,
-            discriminator_B,
-            generator_loss,
-            discriminator_loss,
-            buffer_A,
-            buffer_B,
-            generator_optimizer,
-            discriminator_optimizer,
-            train_dataloader_A,
-            train_dataloader_B,
-            generator_scheduler,
-            discriminator_scheduler,
-        ) = cast(
-            Any,
-            accelerator.prepare(
-                *[model.to(memory_format=torch.channels_last) for model in models],
-                generator_optimizer,
-                discriminator_optimizer,
-                train_dataloader_A,
-                train_dataloader_B,
-                generator_scheduler,
-                discriminator_scheduler,
-            ),
-        )
-        generator_A: nn.Module
-        generator_B: nn.Module
-        discriminator_A: nn.Module
-        discriminator_B: nn.Module
-        generator_loss: nn.Module
-        discriminator_loss: nn.Module
-        buffer_A: nn.Module
-        buffer_B: nn.Module
-        generator_optimizer: optim.Optimizer
-        discriminator_optimizer: optim.Optimizer
-        train_dataloader_A: DataLoader[torch.Tensor]
-        train_dataloader_B: DataLoader[torch.Tensor]
-        generator_scheduler: optim.lr_scheduler.LRScheduler
-        discriminator_scheduler: optim.lr_scheduler.LRScheduler
-
         data_count = min(len(train_dataloader_A), len(train_dataloader_B))
 
         generator_A.train()
         generator_B.train()
 
+        gen_scaler = torch.cuda.amp.grad_scaler.GradScaler()
+        disc_scaler = torch.cuda.amp.grad_scaler.GradScaler()
+
         for epoch in range(1, epochs + 1):
-            accelerator.print(f"== EPOCH: {epoch}/{epochs} ==")
+            print(f"== EPOCH: {epoch}/{epochs} ==")
             gen_losses = torch.zeros(1, device=device)
             disc_losses = torch.zeros(1, device=device)
             x_A: torch.Tensor
             x_B: torch.Tensor
             for x_A, x_B in tqdm.tqdm(zip(train_dataloader_A, train_dataloader_B)):
-                # Generate images
-                fake_A: torch.Tensor = generator_A(x_B)
-                fake_B: torch.Tensor = generator_B(x_A)
-                # Generator loss
-                discriminator_A.requires_grad_(False)
-                discriminator_B.requires_grad_(False)
-                #
-                gen_loss = generator_loss(
-                    x_A,
-                    x_B,
-                    discriminator_A(fake_A),
-                    discriminator_B(fake_B),
-                    generator_A(x_A),
-                    generator_B(x_B),
-                    generator_B(fake_A),
-                    generator_A(fake_B),
-                )
-                gen_losses += gen_loss
                 generator_optimizer.zero_grad(set_to_none=True)
-                accelerator.backward(gen_loss)
-                generator_optimizer.step()
+                #
+                with torch.autocast(device_type=device.type, dtype=autocast_dtype):
+                    # Generate images
+                    fake_A: torch.Tensor = generator_A(x_B)
+                    fake_B: torch.Tensor = generator_B(x_A)
+                    # Generator loss
+                    discriminator_A.requires_grad_(False)
+                    discriminator_B.requires_grad_(False)
+                    #
+                    gen_loss = generator_loss(
+                        x_A,
+                        x_B,
+                        discriminator_A(fake_A),
+                        discriminator_B(fake_B),
+                        generator_A(x_A),
+                        generator_B(x_B),
+                        generator_B(fake_A),
+                        generator_A(fake_B),
+                    )
+                scaled_gen_loss = gen_scaler.scale(gen_loss)
+                gen_losses += scaled_gen_loss
+                scaled_gen_loss.backward()
+                gen_scaler.step(generator_optimizer)
+                gen_scaler.update()
                 # Discriminator loss
                 discriminator_A.requires_grad_(True)
                 discriminator_B.requires_grad_(True)
                 #
-                fakes_A = buffer_A(fake_A.detach())
-                fakes_B = buffer_B(fake_B.detach())
-                disc_loss = discriminator_loss(
-                    discriminator_A(x_A),
-                    discriminator_B(x_B),
-                    discriminator_A(fakes_A),
-                    discriminator_B(fakes_B),
-                )
-                disc_losses += disc_loss
                 discriminator_optimizer.zero_grad(set_to_none=True)
-                accelerator.backward(disc_loss)
-                discriminator_optimizer.step()
+                #
+                with torch.autocast(device_type=device.type, dtype=autocast_dtype):
+                    fakes_A = buffer_A(fake_A.detach())
+                    fakes_B = buffer_B(fake_B.detach())
+                    disc_loss = discriminator_loss(
+                        discriminator_A(x_A),
+                        discriminator_B(x_B),
+                        discriminator_A(fakes_A),
+                        discriminator_B(fakes_B),
+                    )
+                scaled_disc_loss = disc_scaler.scale(disc_loss)
+                disc_losses += scaled_disc_loss
+                scaled_disc_loss.backward()
+                disc_scaler.step(discriminator_optimizer)
+                disc_scaler.update()
             if epoch >= 100:
                 generator_scheduler.step()
                 discriminator_scheduler.step()
             if epoch % 10 == 0:
-                accelerator.save_model(
+                safetensors.torch.save_model(
                     generator_A,
                     os.path.join(checkpoints_folder, f"generator_A_{epoch}"),
                 )
-                accelerator.save_model(
+                safetensors.torch.save_model(
                     generator_B,
                     os.path.join(checkpoints_folder, f"generator_B_{epoch}"),
                 )
-                accelerator.save_model(
+                safetensors.torch.save_model(
                     discriminator_A,
                     os.path.join(checkpoints_folder, f"discriminator_A_{epoch}"),
                 )
-                accelerator.save_model(
+                safetensors.torch.save_model(
                     discriminator_B,
                     os.path.join(checkpoints_folder, f"discriminator_B_{epoch}"),
                 )
-            accelerator.print("Generator loss: ", (gen_losses / data_count).item())
-            accelerator.print("Discriminator loss: ", (disc_losses / data_count).item())
+            print("Generator loss: ", (gen_losses / data_count).item())
+            print("Discriminator loss: ", (disc_losses / data_count).item())
 
 
 if __name__ == "__main__":

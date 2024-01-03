@@ -15,8 +15,6 @@ def get_state_dict(checkpoint_file: str):
 
 
 def visualize_results(dataset_path: str, checkpoints_folder: str = "./checkpoints"):
-    matplotlib.use('Agg')
-
     train_dataset_A = VisionGANDataset(os.path.join(dataset_path, "trainA"))
     train_dataset_B = VisionGANDataset(os.path.join(dataset_path, "trainB"))
 
@@ -45,7 +43,6 @@ def visualize_results(dataset_path: str, checkpoints_folder: str = "./checkpoint
                 os.path.join(
                     checkpoints_folder,
                     "generator_A_" + checkpoint_epoch,
-                    "model.safetensors",
                 )
             )
         )
@@ -54,7 +51,6 @@ def visualize_results(dataset_path: str, checkpoints_folder: str = "./checkpoint
                 os.path.join(
                     checkpoints_folder,
                     "generator_B_" + checkpoint_epoch,
-                    "model.safetensors",
                 )
             )
         )
