@@ -1,18 +1,14 @@
 import os
 import torchvision
 import safetensors.torch
-from main import get_transform
 
 
 def to_safetensors(directory: str, filename: str):
-    transform = get_transform()
     safetensors.torch.save_file(
         {
-            file: transform(
-                torchvision.io.read_image(
-                    os.path.join(directory, file), torchvision.io.ImageReadMode.RGB
-                )
-            ).contiguous()
+            file: torchvision.io.read_image(
+                os.path.join(directory, file), torchvision.io.ImageReadMode.RGB
+            )
             for file in os.listdir(directory)
         },
         filename,

@@ -1,7 +1,6 @@
 import os
 import sys
 import itertools
-import tqdm
 import torch
 import torch.nn as nn
 import torch.nn.functional as nnF
@@ -11,7 +10,7 @@ import torchvision
 from torchvision.transforms import v2
 import safetensors
 import safetensors.torch
-from typing import Any
+from typing import Any, Iterable, TypeVar
 
 
 def get_transform_params():
@@ -24,6 +23,9 @@ def get_transform():
     mean, std = get_transform_params()
     return v2.Compose(
         [
+            v2.Resize(286, v2.InterpolationMode.BICUBIC, antialias=True),
+            v2.RandomCrop(256),
+            v2.RandomHorizontalFlip(),
             v2.ToDtype(torch.get_default_dtype(), scale=True),
             v2.Normalize(mean, std),
         ]
@@ -70,8 +72,8 @@ class VisionGANDataset(Dataset[torch.Tensor]):
 class SafetensorsVisionGANDataset(Dataset[torch.Tensor]):
     def __init__(self, images_file: str, device: str):
         super().__init__()
-        self.images_fp = safetensors.safe_open(images_file, "pt", device)
         self.transform = get_transform()
+        self.images_fp = safetensors.safe_open(images_file, "pt", device)
 
     def __enter__(self):
         self.images_fp = self.images_fp.__enter__()
@@ -85,18 +87,15 @@ class SafetensorsVisionGANDataset(Dataset[torch.Tensor]):
         return len(self.keys)
 
     def __getitem__(self, index: int) -> torch.Tensor:
-        return self.images_fp.get_tensor(self.keys[index])
+        return self.transform(self.images_fp.get_tensor(self.keys[index]))
 
 
 class FullVisionGANDataset(Dataset[torch.Tensor]):
     def __init__(self, images_folder: str, device: str | torch.device):
-        transform = get_transform()
+        self.transform = get_transform()
         self.tensors = [
-            transform(
-                torchvision.io.read_image(
-                    os.path.join(images_folder, image),
-                    torchvision.io.ImageReadMode.RGB,
-                )
+            torchvision.io.read_image(
+                os.path.join(images_folder, image), torchvision.io.ImageReadMode.RGB
             ).to(device)
             for image in os.listdir(images_folder)
         ]
@@ -108,11 +107,10 @@ class FullVisionGANDataset(Dataset[torch.Tensor]):
         pass
 
     def __len__(self) -> int:
-        return 100
         return len(self.tensors)
 
     def __getitem__(self, index: int) -> torch.Tensor:
-        return self.tensors[index]
+        return self.transform(self.tensors[index])
 
 
 class ImageBuffer:
@@ -162,19 +160,19 @@ class ImageBufferUltraFast(nn.Module):
         return self.tensors
 
 
-def Resnet_c7s1_k(in_k: int, out_k: int, output_transform: nn.Module):
+def Resnet_c7s1_k(
+    in_k: int, out_k: int, instance_norm: bool, output_transform: nn.Module
+):
     return nn.Sequential(
-        nn.Conv2d(
-            in_k, out_k, kernel_size=7, stride=1, padding=3, padding_mode="reflect"
-        ),
-        nn.InstanceNorm2d(out_k),
+        nn.Conv2d(in_k, out_k, kernel_size=7, padding=3, padding_mode="reflect"),
+        *((nn.InstanceNorm2d(out_k),) if instance_norm else ()),
         output_transform,
     )
 
 
 def Resnet_dk(in_k: int, out_k: int):
     return nn.Sequential(
-        nn.Conv2d(in_k, out_k, kernel_size=3, stride=2),
+        nn.Conv2d(in_k, out_k, kernel_size=3, stride=2, padding=1),
         nn.InstanceNorm2d(out_k),
         nn.ReLU(inplace=True),
     )
@@ -185,9 +183,10 @@ class Resnet_Rk(nn.Module):
         super().__init__()
         self.model = nn.Sequential(
             nn.Conv2d(in_k, out_k, kernel_size=3, padding=1, padding_mode="reflect"),
+            nn.InstanceNorm2d(out_k),
             nn.ReLU(inplace=True),
             nn.Conv2d(out_k, out_k, kernel_size=3, padding=1, padding_mode="reflect"),
-            nn.ReLU(inplace=True),
+            nn.InstanceNorm2d(out_k),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -198,7 +197,7 @@ class Resnet_Rk(nn.Module):
 def Resnet_uk(in_k: int, out_k: int, output_padding: int = 0):
     return nn.Sequential(
         nn.ConvTranspose2d(
-            in_k, out_k, kernel_size=3, stride=2, output_padding=output_padding
+            in_k, out_k, kernel_size=3, stride=2, padding=1, output_padding=output_padding
         ),
         nn.InstanceNorm2d(out_k),
         nn.ReLU(inplace=True),
@@ -207,19 +206,21 @@ def Resnet_uk(in_k: int, out_k: int, output_padding: int = 0):
 
 def Resnet_k(k: int):
     return nn.Sequential(
-        Resnet_c7s1_k(3, 64, output_transform=nn.ReLU(inplace=True)),
+        Resnet_c7s1_k(
+            3, 64, instance_norm=True, output_transform=nn.ReLU(inplace=True)
+        ),
         Resnet_dk(64, 128),
         Resnet_dk(128, 256),
         *(Resnet_Rk(256, 256) for _ in range(k)),
-        Resnet_uk(256, 128),
+        Resnet_uk(256, 128, output_padding=1),
         Resnet_uk(128, 64, output_padding=1),
-        Resnet_c7s1_k(64, 3, output_transform=nn.Tanh()),
+        Resnet_c7s1_k(64, 3, instance_norm=False, output_transform=nn.Tanh()),
     )
 
 
 def UNet_encoder(in_k: int, out_k: int, batch_norm: bool = True):
     return nn.Sequential(
-        nn.Conv2d(in_k, out_k, kernel_size=4, stride=2),
+        nn.Conv2d(in_k, out_k, kernel_size=4, stride=2, bias=(not batch_norm)),
         *((nn.BatchNorm2d(out_k),) if batch_norm else ()),
         nn.LeakyReLU(negative_slope=0.2, inplace=True),
     )
@@ -234,7 +235,12 @@ def UNet_decoder(
 ):
     return nn.Sequential(
         nn.ConvTranspose2d(
-            in_k, out_k, kernel_size=4, stride=2, output_padding=output_padding
+            in_k,
+            out_k,
+            kernel_size=4,
+            stride=2,
+            output_padding=output_padding,
+            bias=False,
         ),
         nn.BatchNorm2d(out_k),
         *((nn.Dropout(0.5),) if dropout else ()),
@@ -386,33 +392,50 @@ class DiscriminatorLoss(nn.Module):
 
     def forward(
         self,
-        d_A_x_A: torch.Tensor,
-        d_B_x_B: torch.Tensor,
-        d_A_fakes_A: torch.Tensor,
-        d_B_fakes_B: torch.Tensor,
+        d_x: torch.Tensor,
+        d_fakes: torch.Tensor,
     ) -> torch.Tensor:
-        # loss_real_A = torch.mean(
-        #     torch.sum(torch.square(d_A_x_A - 1), dim=(-3, -2, -1))
+        # loss_real = torch.mean(
+        #     torch.sum(torch.square(d_x - 1), dim=(-3, -2, -1))
         # )
-        # loss_real_B = torch.mean(
-        #     torch.sum(torch.square(d_B_x_B - 1), dim=(-3, -2, -1))
+        # loss_fake = torch.mean(
+        #     torch.sum(torch.square(d_fakes), dim=(-3, -2, -1))
         # )
-        # loss_fake_A = torch.mean(
-        #     torch.sum(torch.square(d_A_fakes_A), dim=(-3, -2, -1))
-        # )
-        # loss_fake_B = torch.mean(
-        #     torch.sum(torch.square(d_B_fakes_B), dim=(-3, -2, -1))
-        # )
-        loss_real_A = nnF.mse_loss(d_A_x_A, self.tensor_1)
-        loss_real_B = nnF.mse_loss(d_B_x_B, self.tensor_1)
-        loss_fake_A = nnF.mse_loss(d_A_fakes_A, self.tensor_0)
-        loss_fake_B = nnF.mse_loss(d_B_fakes_B, self.tensor_0)
-        # return 18 * (loss_real_A + loss_real_B + loss_fake_A + loss_fake_B)
-        return 0.5 * (loss_real_A + loss_real_B + loss_fake_A + loss_fake_B)
+        loss_real = nnF.mse_loss(d_x, self.tensor_1)
+        loss_fake = nnF.mse_loss(d_fakes, self.tensor_0)
+        # return 18 * (loss_real + loss_fake)
+        return 0.5 * (loss_real + loss_fake)
 
 
 def custom_collate(data: list[torch.Tensor]) -> torch.Tensor:
     return torch.stack(data).to(memory_format=torch.channels_last)
+
+
+T1 = TypeVar("T1")
+T2 = TypeVar("T2")
+
+
+def zip_long(it1: Iterable[T1], it2: Iterable[T2]) -> Iterable[tuple[T1, T2]]:
+    i1 = iter(it1)
+    i2 = iter(it2)
+    b1 = False
+    b2 = False
+    while True:
+        try:
+            n1 = next(i1)
+        except StopIteration:
+            b1 = True
+            i1 = iter(it1)
+            n1 = next(i1)
+        try:
+            n2 = next(i2)
+        except StopIteration:
+            b2 = True
+            i2 = iter(it2)
+            n2 = next(i2)
+        if b1 and b2:
+            break
+        yield n1, n2
 
 
 def main(filename: str, checkpoints_folder: str = "./checkpoints"):
@@ -425,18 +448,21 @@ def main(filename: str, checkpoints_folder: str = "./checkpoints"):
     lambda_ident = 0.5
     buffer_size = 50
     autocast_dtype = torch.float16
-    
+
     if not torch.cuda.is_available():
-        print('gtfo')
+        print("gtfo")
         exit()
     if torch.cuda.device_count() > 1:
-        print("You have multiple cuda devices available, count: ", torch.cuda.device_count())
+        print(
+            "You have multiple cuda devices available, count: ",
+            torch.cuda.device_count(),
+        )
     device = torch.device("cuda", torch.cuda.current_device())
 
     with FullVisionGANDataset(
-        "./horse2zebra/trainA", device
+        "./monet2photo/trainA", device
     ) as train_dataset_A, FullVisionGANDataset(
-        "./horse2zebra/trainB", device
+        "./monet2photo/trainB", device
     ) as train_dataset_B:
         train_dataloader_A = DataLoader(
             train_dataset_A, batch_size, shuffle=True, collate_fn=custom_collate
@@ -492,8 +518,7 @@ def main(filename: str, checkpoints_folder: str = "./checkpoints"):
         generator_A.train()
         generator_B.train()
 
-        gen_scaler = torch.cuda.amp.grad_scaler.GradScaler()
-        disc_scaler = torch.cuda.amp.grad_scaler.GradScaler()
+        scaler = torch.cuda.amp.grad_scaler.GradScaler()
 
         for epoch in range(1, epochs + 1):
             print(f"== EPOCH: {epoch}/{epochs} ==")
@@ -501,7 +526,7 @@ def main(filename: str, checkpoints_folder: str = "./checkpoints"):
             disc_losses = torch.zeros(1, device=device)
             x_A: torch.Tensor
             x_B: torch.Tensor
-            for x_A, x_B in tqdm.tqdm(zip(train_dataloader_A, train_dataloader_B)):
+            for x_A, x_B in zip_long(train_dataloader_A, train_dataloader_B):
                 generator_optimizer.zero_grad(set_to_none=True)
                 #
                 with torch.autocast(device_type=device.type, dtype=autocast_dtype):
@@ -522,11 +547,9 @@ def main(filename: str, checkpoints_folder: str = "./checkpoints"):
                         generator_B(fake_A),
                         generator_A(fake_B),
                     )
-                scaled_gen_loss = gen_scaler.scale(gen_loss)
-                gen_losses += scaled_gen_loss
-                scaled_gen_loss.backward()
-                gen_scaler.step(generator_optimizer)
-                gen_scaler.update()
+                    gen_losses += gen_loss
+                scaler.scale(gen_loss).backward()
+                scaler.step(generator_optimizer)
                 # Discriminator loss
                 discriminator_A.requires_grad_(True)
                 discriminator_B.requires_grad_(True)
@@ -535,18 +558,22 @@ def main(filename: str, checkpoints_folder: str = "./checkpoints"):
                 #
                 with torch.autocast(device_type=device.type, dtype=autocast_dtype):
                     fakes_A = buffer_A(fake_A.detach())
-                    fakes_B = buffer_B(fake_B.detach())
-                    disc_loss = discriminator_loss(
+                    disc_loss_A = discriminator_loss(
                         discriminator_A(x_A),
-                        discriminator_B(x_B),
                         discriminator_A(fakes_A),
+                    )
+                    fakes_B = buffer_B(fake_B.detach())
+                    disc_loss_B = discriminator_loss(
+                        discriminator_B(x_B),
                         discriminator_B(fakes_B),
                     )
-                scaled_disc_loss = disc_scaler.scale(disc_loss)
-                disc_losses += scaled_disc_loss
-                scaled_disc_loss.backward()
-                disc_scaler.step(discriminator_optimizer)
-                disc_scaler.update()
+                    disc_losses += disc_loss_A
+                    disc_losses += disc_loss_B
+                scaler.scale(disc_loss_A).backward()
+                scaler.scale(disc_loss_B).backward()
+                scaler.step(discriminator_optimizer)
+                #
+                scaler.update()
             if epoch >= 100:
                 generator_scheduler.step()
                 discriminator_scheduler.step()
