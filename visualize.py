@@ -4,17 +4,21 @@ import torch
 import safetensors.torch
 from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
-from main import VisionGANDataset, Resnet_k, get_inverse_transform
+from main import (
+    VisionGANDataset,
+    Resnet_k,
+    get_inverse_transform,
+    get_checkpoint_epochs,
+)
 
 
-def get_state_dict(checkpoint_file: str):
-    return {
-        k.lstrip("_orig_mod."): v
-        for k, v in safetensors.torch.load_file(checkpoint_file).items()
-    }
-
-
-def visualize_results(dataset_path: str, num_photos: int = 5, checkpoints_folder: str = "./checkpoints"):
+def visualize_results(
+    dataset_path: str,
+    num_photos: int = 5,
+    save: bool = False,
+    only_latest: bool = False,
+    checkpoints_folder: str = "./checkpoints",
+):
     train_dataset_A = VisionGANDataset(os.path.join(dataset_path, "trainA"))
     train_dataset_B = VisionGANDataset(os.path.join(dataset_path, "trainB"))
 
@@ -30,44 +34,47 @@ def visualize_results(dataset_path: str, num_photos: int = 5, checkpoints_folder
     ax3: plt.Axes
 
     with torch.no_grad():
-        for checkpoint_epoch in sorted(
-            set(map(lambda x: x.rsplit("_", 1)[1], os.listdir(checkpoints_folder))), reverse=True, key=lambda x: int(x)
-        ):
-            generator_A.load_state_dict(
-                get_state_dict(
-                    os.path.join(
-                        checkpoints_folder,
-                        "generator_A_" + checkpoint_epoch,
-                    )
-                )
+        for checkpoint_epoch in get_checkpoint_epochs(checkpoints_folder):
+            safetensors.torch.load_model(
+                generator_A,
+                os.path.join(
+                    checkpoints_folder,
+                    "generator_A_" + checkpoint_epoch,
+                ),
             )
-            generator_B.load_state_dict(
-                get_state_dict(
-                    os.path.join(
-                        checkpoints_folder,
-                        "generator_B_" + checkpoint_epoch,
-                    )
-                )
+            safetensors.torch.load_model(
+                generator_B,
+                os.path.join(
+                    checkpoints_folder,
+                    "generator_B_" + checkpoint_epoch,
+                ),
             )
 
-            for _ in range(num_photos):
-                index = random.randint(0, min(len(train_dataset_A), len(train_dataset_B)) - 1)
-                real_B = train_dataset_B[index]
+            for i in range(num_photos):
+                real_B = random.choice(train_dataset_B)
                 fake_A = generator_A(real_B)
-                real_A = train_dataset_A[index]
+                real_A = random.choice(train_dataset_A)
                 fake_B = generator_B(real_A)
 
-                fig, ((ax0, ax1), (ax2, ax3)) = plt.subplots(2, 2)
+                fig, ((ax0, ax1), (ax2, ax3)) = plt.subplots(
+                    2, 2, figsize=(15, 8), constrained_layout=True
+                )
                 ax0.set_title("Real")
                 ax1.set_title("Fake")
 
-                fig.suptitle(checkpoint_epoch)
+                fig.suptitle("Epoch: " + checkpoint_epoch)
                 ax0.imshow(inv_transform(real_B).permute(1, 2, 0))
                 ax1.imshow(inv_transform(fake_A).permute(1, 2, 0))
                 ax2.imshow(inv_transform(real_A).permute(1, 2, 0))
                 ax3.imshow(inv_transform(fake_B).permute(1, 2, 0))
 
-                plt.show()
+                if save:
+                    plt.savefig(checkpoint_epoch + "_" + str(i) + ".png")
+                else:
+                    plt.show()
+
+            if only_latest:
+                break
 
 
-visualize_results("./monet2photo")
+visualize_results("./horse2zebra", only_latest=True)

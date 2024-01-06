@@ -10,7 +10,15 @@ import torchvision
 from torchvision.transforms import v2
 import safetensors
 import safetensors.torch
-from typing import Any, Iterable, TypeVar
+from typing import Any, cast, Callable, Iterable, TypeVar
+
+
+def get_checkpoint_epochs(checkpoints_folder: str):
+    return sorted(
+        set(map(lambda x: x.rsplit("_", 1)[1], os.listdir(checkpoints_folder))),
+        reverse=True,
+        key=lambda x: int(x),
+    )
 
 
 def get_transform_params():
@@ -160,6 +168,27 @@ class ImageBufferUltraFast(nn.Module):
         return self.tensors
 
 
+def init_module(
+    model: nn.Module, init: Callable[[nn.Module], Any], *classes: type[nn.Module]
+):
+    for m in model.modules():
+        if isinstance(m, cast(Any, classes)):
+            init(m)
+
+
+def init_conv(model: nn.Module, init: Callable[[torch.Tensor], Any]):
+    init_module(
+        model,
+        lambda x: init(cast(nn.Conv2d, x).weight),
+        nn.Conv1d,
+        nn.Conv2d,
+        nn.Conv3d,
+        nn.ConvTranspose1d,
+        nn.ConvTranspose2d,
+        nn.ConvTranspose3d,
+    )
+
+
 def Resnet_c7s1_k(
     in_k: int, out_k: int, instance_norm: bool, output_transform: nn.Module
 ):
@@ -197,7 +226,12 @@ class Resnet_Rk(nn.Module):
 def Resnet_uk(in_k: int, out_k: int, output_padding: int = 0):
     return nn.Sequential(
         nn.ConvTranspose2d(
-            in_k, out_k, kernel_size=3, stride=2, padding=1, output_padding=output_padding
+            in_k,
+            out_k,
+            kernel_size=3,
+            stride=2,
+            padding=1,
+            output_padding=output_padding,
         ),
         nn.InstanceNorm2d(out_k),
         nn.ReLU(inplace=True),
@@ -438,7 +472,7 @@ def zip_long(it1: Iterable[T1], it2: Iterable[T2]) -> Iterable[tuple[T1, T2]]:
         yield n1, n2
 
 
-def main(filename: str, checkpoints_folder: str = "./checkpoints"):
+def main(_: str, checkpoints_folder: str = "./checkpoints", train: str = ""):
     torch.backends.cudnn.benchmark = True
 
     lr = 0.0002
@@ -447,11 +481,9 @@ def main(filename: str, checkpoints_folder: str = "./checkpoints"):
     lambda_param = 10
     lambda_ident = 0.5
     buffer_size = 50
-    autocast_dtype = torch.float16
 
     if not torch.cuda.is_available():
-        print("gtfo")
-        exit()
+        raise RuntimeError("Cuda not available")
     if torch.cuda.device_count() > 1:
         print(
             "You have multiple cuda devices available, count: ",
@@ -460,9 +492,9 @@ def main(filename: str, checkpoints_folder: str = "./checkpoints"):
     device = torch.device("cuda", torch.cuda.current_device())
 
     with FullVisionGANDataset(
-        "./monet2photo/trainA", device
+        "./horse2zebra/trainA", device
     ) as train_dataset_A, FullVisionGANDataset(
-        "./monet2photo/trainB", device
+        "./horse2zebra/trainB", device
     ) as train_dataset_B:
         train_dataloader_A = DataLoader(
             train_dataset_A, batch_size, shuffle=True, collate_fn=custom_collate
@@ -475,6 +507,9 @@ def main(filename: str, checkpoints_folder: str = "./checkpoints"):
         generator_B = Resnet_k(9).to(device)
         discriminator_A = PatchGAN().to(device)
         discriminator_B = PatchGAN().to(device)
+
+        for model in (generator_A, generator_B, discriminator_A, discriminator_B):
+            init_conv(model, nn.init.xavier_normal_)
 
         generator_loss = GeneratorLoss(lambda_param, lambda_ident).to(device)
         discriminator_loss = DiscriminatorLoss(buffer_size).to(device)
@@ -493,43 +528,98 @@ def main(filename: str, checkpoints_folder: str = "./checkpoints"):
             betas=(0.5, 0.999),
         )
 
-        def lambda_rule(epoch: int):
-            lr_l = 1.0 - max(0, epoch + 1 - 100) / float(100 + 1)
-            return lr_l
-
-        # generator_scheduler = optim.lr_scheduler.LinearLR(
-        #     generator_optimizer, start_factor=1, end_factor=0, total_iters=100
-        # )
-        # discriminator_scheduler = optim.lr_scheduler.LinearLR(
-        #     discriminator_optimizer, start_factor=1, end_factor=0, total_iters=100
-        # )
-        generator_scheduler = optim.lr_scheduler.LambdaLR(
-            generator_optimizer, lambda_rule
+        generator_scheduler = optim.lr_scheduler.LinearLR(
+            generator_optimizer, start_factor=1, end_factor=0, total_iters=100
         )
-        discriminator_scheduler = optim.lr_scheduler.LambdaLR(
-            discriminator_optimizer, lambda_rule
+        discriminator_scheduler = optim.lr_scheduler.LinearLR(
+            discriminator_optimizer, start_factor=1, end_factor=0, total_iters=100
         )
 
-        if not os.path.exists(checkpoints_folder):
-            os.mkdir(checkpoints_folder)
-
-        data_count = min(len(train_dataloader_A), len(train_dataloader_B))
+        data_count = max(len(train_dataloader_A), len(train_dataloader_B))
 
         generator_A.train()
         generator_B.train()
 
         scaler = torch.cuda.amp.grad_scaler.GradScaler()
 
-        for epoch in range(1, epochs + 1):
-            print(f"== EPOCH: {epoch}/{epochs} ==")
+        writer = print
+
+        if not os.path.exists(checkpoints_folder):
+            os.mkdir(checkpoints_folder)
+            
+        start_epoch = 0
+
+        if train == "resume":
+            checkpoint_epochs = get_checkpoint_epochs(checkpoints_folder)
+            if len(checkpoint_epochs) == 0:
+                raise RuntimeError("No checkpoints found")
+            start_epoch = int(checkpoint_epochs[0])
+            safetensors.torch.load_model(
+                generator_A,
+                os.path.join(checkpoints_folder, f"generator_A_{start_epoch}"),
+            )
+            safetensors.torch.load_model(
+                generator_B,
+                os.path.join(checkpoints_folder, f"generator_B_{start_epoch}"),
+            )
+            safetensors.torch.load_model(
+                discriminator_A,
+                os.path.join(checkpoints_folder, f"discriminator_A_{start_epoch}"),
+            )
+            safetensors.torch.load_model(
+                discriminator_B,
+                os.path.join(checkpoints_folder, f"discriminator_B_{start_epoch}"),
+            )
+            generator_optimizer.load_state_dict(
+                torch.load(
+                    os.path.join(
+                        checkpoints_folder, f"generator_optimizer_{start_epoch}"
+                    ),
+                )
+            )
+            discriminator_optimizer.load_state_dict(
+                torch.load(
+                    os.path.join(
+                        checkpoints_folder, f"discriminator_optimizer_{start_epoch}"
+                    ),
+                )
+            )
+            generator_scheduler.load_state_dict(
+                torch.load(
+                    os.path.join(
+                        checkpoints_folder, f"generator_scheduler_{start_epoch}"
+                    ),
+                )
+            )
+            discriminator_scheduler.load_state_dict(
+                torch.load(
+                    os.path.join(
+                        checkpoints_folder, f"discriminator_scheduler_{start_epoch}"
+                    ),
+                )
+            )
+            scaler.load_state_dict(
+                torch.load(
+                    os.path.join(checkpoints_folder, f"scaler_{start_epoch}"),
+                )
+            )
+        
+        x_A: torch.Tensor
+        x_B: torch.Tensor
+        
+        with torch.no_grad():
+            for i, x_A, x_B in zip(range(buffer_size), train_dataloader_A, train_dataloader_B):
+                buffer_A(generator_A(x_B))
+                buffer_B(generator_B(x_A))
+
+        for epoch in range(start_epoch + 1, epochs + 1):
+            writer(f"== EPOCH: {epoch}/{epochs} ==")
             gen_losses = torch.zeros(1, device=device)
             disc_losses = torch.zeros(1, device=device)
-            x_A: torch.Tensor
-            x_B: torch.Tensor
             for x_A, x_B in zip_long(train_dataloader_A, train_dataloader_B):
                 generator_optimizer.zero_grad(set_to_none=True)
                 #
-                with torch.autocast(device_type=device.type, dtype=autocast_dtype):
+                with torch.autocast(device_type=device.type, dtype=torch.float16):
                     # Generate images
                     fake_A: torch.Tensor = generator_A(x_B)
                     fake_B: torch.Tensor = generator_B(x_A)
@@ -556,7 +646,7 @@ def main(filename: str, checkpoints_folder: str = "./checkpoints"):
                 #
                 discriminator_optimizer.zero_grad(set_to_none=True)
                 #
-                with torch.autocast(device_type=device.type, dtype=autocast_dtype):
+                with torch.autocast(device_type=device.type, dtype=torch.float16):
                     fakes_A = buffer_A(fake_A.detach())
                     disc_loss_A = discriminator_loss(
                         discriminator_A(x_A),
@@ -577,6 +667,8 @@ def main(filename: str, checkpoints_folder: str = "./checkpoints"):
             if epoch >= 100:
                 generator_scheduler.step()
                 discriminator_scheduler.step()
+            writer("Generator loss: ", (gen_losses / data_count).item())
+            writer("Discriminator loss: ", (disc_losses / data_count).item())
             if epoch % 10 == 0:
                 safetensors.torch.save_model(
                     generator_A,
@@ -594,8 +686,30 @@ def main(filename: str, checkpoints_folder: str = "./checkpoints"):
                     discriminator_B,
                     os.path.join(checkpoints_folder, f"discriminator_B_{epoch}"),
                 )
-            print("Generator loss: ", (gen_losses / data_count).item())
-            print("Discriminator loss: ", (disc_losses / data_count).item())
+                torch.save(
+                    generator_optimizer.state_dict(),
+                    os.path.join(checkpoints_folder, f"generator_optimizer_{epoch}"),
+                )
+                torch.save(
+                    discriminator_optimizer.state_dict(),
+                    os.path.join(
+                        checkpoints_folder, f"discriminator_optimizer_{epoch}"
+                    ),
+                )
+                torch.save(
+                    generator_scheduler.state_dict(),
+                    os.path.join(checkpoints_folder, f"generator_scheduler_{epoch}"),
+                )
+                torch.save(
+                    discriminator_scheduler.state_dict(),
+                    os.path.join(
+                        checkpoints_folder, f"discriminator_scheduler_{epoch}"
+                    ),
+                )
+                torch.save(
+                    scaler.state_dict(),
+                    os.path.join(checkpoints_folder, f"scaler_{epoch}"),
+                )
 
 
 if __name__ == "__main__":
