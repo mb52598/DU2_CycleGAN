@@ -1,5 +1,4 @@
 import os
-import sys
 import itertools
 import torch
 import torch.nn as nn
@@ -10,6 +9,8 @@ import torchvision
 from torchvision.transforms import v2
 import safetensors
 import safetensors.torch
+import tqdm
+import argparse
 from typing import Any, cast, Callable, Iterable, TypeVar
 
 
@@ -472,9 +473,7 @@ def zip_long(it1: Iterable[T1], it2: Iterable[T2]) -> Iterable[tuple[T1, T2]]:
         yield n1, n2
 
 
-def main(_: str, checkpoints_folder: str = "./checkpoints", train: str = ""):
-    torch.backends.cudnn.benchmark = True
-
+def train_model(checkpoints_folder: str, resume: bool, compile_models: bool):
     lr = 0.0002
     batch_size = 1
     epochs = 200
@@ -490,6 +489,9 @@ def main(_: str, checkpoints_folder: str = "./checkpoints", train: str = ""):
             torch.cuda.device_count(),
         )
     device = torch.device("cuda", torch.cuda.current_device())
+
+    torch.backends.cudnn.enabled = True
+    torch.backends.cudnn.benchmark = True
 
     with FullVisionGANDataset(
         "./horse2zebra/trainA", device
@@ -516,6 +518,16 @@ def main(_: str, checkpoints_folder: str = "./checkpoints", train: str = ""):
 
         buffer_A = ImageBufferUltraFast(buffer_size, 3, 256, 256).to(device)
         buffer_B = ImageBufferUltraFast(buffer_size, 3, 256, 256).to(device)
+
+        if compile_models:
+            generator_A: nn.Module = torch.compile(generator_A)
+            generator_B: nn.Module = torch.compile(generator_B)
+            discriminator_A: nn.Module = torch.compile(discriminator_A)
+            discriminator_B: nn.Module = torch.compile(discriminator_B)
+            generator_loss: nn.Module = torch.compile(generator_loss)
+            discriminator_loss: nn.Module = torch.compile(discriminator_loss)
+            buffer_A: nn.Module = torch.compile(buffer_A)
+            buffer_B: nn.Module = torch.compile(buffer_B)
 
         generator_optimizer = optim.Adam(
             itertools.chain(generator_A.parameters(), generator_B.parameters()),
@@ -546,10 +558,10 @@ def main(_: str, checkpoints_folder: str = "./checkpoints", train: str = ""):
 
         if not os.path.exists(checkpoints_folder):
             os.mkdir(checkpoints_folder)
-            
+
         start_epoch = 0
 
-        if train == "resume":
+        if resume:
             checkpoint_epochs = get_checkpoint_epochs(checkpoints_folder)
             if len(checkpoint_epochs) == 0:
                 raise RuntimeError("No checkpoints found")
@@ -603,12 +615,14 @@ def main(_: str, checkpoints_folder: str = "./checkpoints", train: str = ""):
                     os.path.join(checkpoints_folder, f"scaler_{start_epoch}"),
                 )
             )
-        
+
         x_A: torch.Tensor
         x_B: torch.Tensor
-        
+
         with torch.no_grad():
-            for i, x_A, x_B in zip(range(buffer_size), train_dataloader_A, train_dataloader_B):
+            for _, x_A, x_B in zip(
+                range(buffer_size), train_dataloader_A, train_dataloader_B
+            ):
                 buffer_A(generator_A(x_B))
                 buffer_B(generator_B(x_A))
 
@@ -616,7 +630,7 @@ def main(_: str, checkpoints_folder: str = "./checkpoints", train: str = ""):
             writer(f"== EPOCH: {epoch}/{epochs} ==")
             gen_losses = torch.zeros(1, device=device)
             disc_losses = torch.zeros(1, device=device)
-            for x_A, x_B in zip_long(train_dataloader_A, train_dataloader_B):
+            for x_A, x_B in tqdm.tqdm(zip_long(train_dataloader_A, train_dataloader_B)):
                 generator_optimizer.zero_grad(set_to_none=True)
                 #
                 with torch.autocast(device_type=device.type, dtype=torch.float16):
@@ -712,5 +726,33 @@ def main(_: str, checkpoints_folder: str = "./checkpoints", train: str = ""):
                 )
 
 
+def main():
+    parser = argparse.ArgumentParser("CycleGAN")
+    parser.add_argument(
+        "-chd",
+        "--checkpoint_dir",
+        dest="checkpoint_dir",
+        type=str,
+        default="./checkpoints",
+        help="where to store the model checkpoints",
+    )
+    parser.add_argument(
+        "-r",
+        "--resume",
+        dest="resume",
+        action="store_true",
+        help="whether to resume training from the checkpoints directory",
+    )
+    parser.add_argument(
+        "-c",
+        "--compile",
+        dest="compile_model",
+        action="store_true",
+        help="whether to compile the model before running using the default torch.dynamo backend",
+    )
+    args = parser.parse_args()
+    train_model(args.checkpoint_dir, args.resume, args.compile_model)
+
+
 if __name__ == "__main__":
-    main(*sys.argv)
+    main()

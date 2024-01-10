@@ -1,0 +1,5 @@
+torch==2.1.2+cu118
+torchvision==0.16.2
+safetensors==0.4.1
+tqdm==4.64.1
+matplotlib==3.6.2
