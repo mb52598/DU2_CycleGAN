@@ -1,9 +1,11 @@
 import os
 import random
+import argparse
 import torch
 import safetensors.torch
 from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
+from download_dataset import DatasetNames, dataset_names
 from main import (
     VisionGANDataset,
     Resnet_k,
@@ -13,11 +15,11 @@ from main import (
 
 
 def visualize_results(
-    dataset_path: str,
+    dataset_path: DatasetNames,
+    checkpoints_folder: str = "./checkpoints",
     num_photos: int = 5,
     save: bool = False,
     only_latest: bool = False,
-    checkpoints_folder: str = "./checkpoints",
 ):
     train_dataset_A = VisionGANDataset(os.path.join(dataset_path, "trainA"))
     train_dataset_B = VisionGANDataset(os.path.join(dataset_path, "trainB"))
@@ -77,4 +79,55 @@ def visualize_results(
                 break
 
 
-visualize_results("./horse2zebra", only_latest=True)
+def main():
+    parser = argparse.ArgumentParser("CycleGAN visualizer")
+    parser.add_argument(
+        "-ds",
+        "--dataset",
+        dest="dataset_name",
+        choices=dataset_names,
+        help="name of the dataset to use for visualization",
+        required=True,
+    )
+    parser.add_argument(
+        "-chd",
+        "--checkpoint-dir",
+        dest="checkpoint_dir",
+        type=str,
+        default="./checkpoints",
+        help="from where to load the model checkpoints",
+    )
+    parser.add_argument(
+        "-np",
+        "--num-photos",
+        dest="num_photos",
+        type=int,
+        default=5,
+        help="how many photos to display",
+    )
+    parser.add_argument(
+        "-ol",
+        "--only-latest",
+        dest="only_latest",
+        action="store_true",
+        help="whether to display only the latest epoch",
+    )
+    parser.add_argument(
+        "-sp",
+        "--save-photos",
+        dest="save_photos",
+        action="store_true",
+        help="whether to save the photos instead of displaying",
+    )
+    args = parser.parse_args()
+    visualize_results(
+        args.dataset_name,
+        args.checkpoint_dir,
+        args.num_photos,
+        args.save_photos,
+        args.only_latest,
+    )
+
+
+if __name__ == "__main__":
+    main()

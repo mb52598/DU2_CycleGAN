@@ -1,8 +1,22 @@
 import os
+import argparse
 import urllib.request
 import zipfile
 from typing import Literal
 
+dataset_names = [
+    "apple2orange",
+    "summer2winter_yosemite",
+    "horse2zebra",
+    "monet2photo",
+    "cezanne2photo",
+    "ukiyoe2photo",
+    "vangogh2photo",
+    "maps",
+    "facades",
+    "iphone2dslr_flower",
+    "ae_photos",
+]
 DatasetNames = Literal[
     "apple2orange",
     "summer2winter_yosemite",
@@ -36,4 +50,19 @@ def download_dataset(name: DatasetNames):
     os.remove(filename)
 
 
-download_dataset("horse2zebra")
+def main():
+    parser = argparse.ArgumentParser("CycleGAN dataset downloader")
+    parser.add_argument(
+        "-ds",
+        "--dataset",
+        dest="dataset_name",
+        choices=dataset_names,
+        help="name of the dataset to download",
+        required=True,
+    )
+    args = parser.parse_args()
+    download_dataset(args.dataset_name)
+
+
+if __name__ == "__main__":
+    main()

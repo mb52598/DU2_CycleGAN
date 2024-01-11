@@ -11,7 +11,8 @@ import safetensors
 import safetensors.torch
 import tqdm
 import argparse
-from typing import Any, cast, Callable, Iterable, TypeVar
+from typing import Any, cast, Callable, Iterable, Literal, TypeVar
+from download_dataset import dataset_names
 
 
 def get_checkpoint_epochs(checkpoints_folder: str):
@@ -473,7 +474,15 @@ def zip_long(it1: Iterable[T1], it2: Iterable[T2]) -> Iterable[tuple[T1, T2]]:
         yield n1, n2
 
 
-def train_model(checkpoints_folder: str, resume: bool, compile_models: bool):
+def train_model(
+    dataset_name: str,
+    checkpoints_folder: str,
+    resume: bool = False,
+    compile_models: bool = False,
+    compile_mode: Literal[
+        "default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"
+    ] = "default",
+):
     lr = 0.0002
     batch_size = 1
     epochs = 200
@@ -494,9 +503,9 @@ def train_model(checkpoints_folder: str, resume: bool, compile_models: bool):
     torch.backends.cudnn.benchmark = True
 
     with FullVisionGANDataset(
-        "./horse2zebra/trainA", device
+        os.path.join(dataset_name, "trainA"), device
     ) as train_dataset_A, FullVisionGANDataset(
-        "./horse2zebra/trainB", device
+        os.path.join(dataset_name, "trainB"), device
     ) as train_dataset_B:
         train_dataloader_A = DataLoader(
             train_dataset_A, batch_size, shuffle=True, collate_fn=custom_collate
@@ -520,14 +529,30 @@ def train_model(checkpoints_folder: str, resume: bool, compile_models: bool):
         buffer_B = ImageBufferUltraFast(buffer_size, 3, 256, 256).to(device)
 
         if compile_models:
-            generator_A: nn.Module = torch.compile(generator_A)
-            generator_B: nn.Module = torch.compile(generator_B)
-            discriminator_A: nn.Module = torch.compile(discriminator_A)
-            discriminator_B: nn.Module = torch.compile(discriminator_B)
-            generator_loss: nn.Module = torch.compile(generator_loss)
-            discriminator_loss: nn.Module = torch.compile(discriminator_loss)
-            buffer_A: nn.Module = torch.compile(buffer_A)
-            buffer_B: nn.Module = torch.compile(buffer_B)
+            generator_A: nn.Module = torch.compile(
+                generator_A, dynamic=False, mode=compile_mode
+            )
+            generator_B: nn.Module = torch.compile(
+                generator_B, dynamic=False, mode=compile_mode
+            )
+            discriminator_A: nn.Module = torch.compile(
+                discriminator_A, dynamic=False, mode=compile_mode
+            )
+            discriminator_B: nn.Module = torch.compile(
+                discriminator_B, dynamic=False, mode=compile_mode
+            )
+            generator_loss: nn.Module = torch.compile(
+                generator_loss, dynamic=False, mode=compile_mode
+            )
+            discriminator_loss: nn.Module = torch.compile(
+                discriminator_loss, dynamic=False, mode=compile_mode
+            )
+            buffer_A: nn.Module = torch.compile(
+                buffer_A, dynamic=False, mode=compile_mode
+            )
+            buffer_B: nn.Module = torch.compile(
+                buffer_B, dynamic=False, mode=compile_mode
+            )
 
         generator_optimizer = optim.Adam(
             itertools.chain(generator_A.parameters(), generator_B.parameters()),
@@ -729,8 +754,16 @@ def train_model(checkpoints_folder: str, resume: bool, compile_models: bool):
 def main():
     parser = argparse.ArgumentParser("CycleGAN")
     parser.add_argument(
+        "-ds",
+        "--dataset",
+        dest="dataset_name",
+        choices=dataset_names,
+        help="name of the dataset to use for training",
+        required=True,
+    )
+    parser.add_argument(
         "-chd",
-        "--checkpoint_dir",
+        "--checkpoint-dir",
         dest="checkpoint_dir",
         type=str,
         default="./checkpoints",
@@ -750,8 +783,27 @@ def main():
         action="store_true",
         help="whether to compile the model before running using the default torch.dynamo backend",
     )
+    parser.add_argument(
+        "-cm",
+        "--compile-mode",
+        dest="compile_mode",
+        choices=[
+            "default",
+            "reduce-overhead",
+            "max-autotune",
+            "max-autotune-no-cudagraphs",
+        ],
+        default="default",
+        help="mode of compilation, only useful if model compilation is enabled",
+    )
     args = parser.parse_args()
-    train_model(args.checkpoint_dir, args.resume, args.compile_model)
+    train_model(
+        args.dataset_name,
+        args.checkpoint_dir,
+        args.resume,
+        args.compile_model,
+        args.compile_mode,
+    )
 
 
 if __name__ == "__main__":
