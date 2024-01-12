@@ -142,7 +142,7 @@ class ImageBuffer:
         return torch.concat(self.tensors)
 
 
-class ImageBufferFast(nn.Module):
+class ImageBufferSlow(nn.Module):
     tensors: torch.Tensor
 
     def __init__(self, buffer_size: int, *size: int):
@@ -423,7 +423,7 @@ class DiscriminatorLoss(nn.Module):
 
     def __init__(self, buffer_size: int):
         super().__init__()
-        self.register_buffer("tensor_0", torch.zeros(buffer_size, 1, 6, 6))
+        self.register_buffer("tensor_0", torch.zeros(buffer_size, 1, 6, 6)) # ovdje je buffer_size zato sto radi gresku nad fakes kojih ima buffer_size
         self.register_buffer("tensor_1", torch.ones(1, 1, 6, 6))
 
     def forward(
@@ -546,12 +546,6 @@ def train_model(
             )
             discriminator_loss: nn.Module = torch.compile(
                 discriminator_loss, dynamic=False, mode=compile_mode
-            )
-            buffer_A: nn.Module = torch.compile(
-                buffer_A, dynamic=False, mode=compile_mode
-            )
-            buffer_B: nn.Module = torch.compile(
-                buffer_B, dynamic=False, mode=compile_mode
             )
 
         generator_optimizer = optim.Adam(
