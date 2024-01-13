@@ -11,7 +11,8 @@ import safetensors
 import safetensors.torch
 import tqdm
 import argparse
-from typing import Any, cast, Callable, Iterable, Literal, TypeVar
+import json
+from typing import Any, cast, Callable, Iterable, NamedTuple, Literal, TypeVar
 from download_dataset import dataset_names
 
 
@@ -189,6 +190,29 @@ def init_conv(model: nn.Module, init: Callable[[torch.Tensor], Any]):
         nn.ConvTranspose2d,
         nn.ConvTranspose3d,
     )
+
+
+class Configuration(NamedTuple):
+    lr: float
+    epochs: int
+    lambda_param: float
+    lambda_ident: float
+    buffer_size: int
+
+
+def get_configuration(filepath: str) -> Configuration:
+    with open(filepath, "rb") as file:
+        data = json.load(file)
+        try:
+            return Configuration(
+                data["lr"],
+                data["epochs"],
+                data["lambda_param"],
+                data["lambda_ident"],
+                data["buffer_size"],
+            )
+        except:
+            raise RuntimeError("Invalid configuration file")
 
 
 def Resnet_c7s1_k(
@@ -423,7 +447,9 @@ class DiscriminatorLoss(nn.Module):
 
     def __init__(self, buffer_size: int):
         super().__init__()
-        self.register_buffer("tensor_0", torch.zeros(buffer_size, 1, 6, 6)) # ovdje je buffer_size zato sto radi gresku nad fakes kojih ima buffer_size
+        self.register_buffer(
+            "tensor_0", torch.zeros(buffer_size, 1, 6, 6)
+        )  # ovdje je buffer_size zato sto radi gresku nad fakes kojih ima buffer_size
         self.register_buffer("tensor_1", torch.ones(1, 1, 6, 6))
 
     def forward(
@@ -477,18 +503,19 @@ def zip_long(it1: Iterable[T1], it2: Iterable[T2]) -> Iterable[tuple[T1, T2]]:
 def train_model(
     dataset_name: str,
     checkpoints_folder: str,
+    configuration_path: str,
     resume: bool = False,
     compile_models: bool = False,
     compile_mode: Literal[
         "default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"
     ] = "default",
 ):
-    lr = 0.0002
-    batch_size = 1
-    epochs = 200
-    lambda_param = 10
-    lambda_ident = 0.5
-    buffer_size = 50
+    config = get_configuration(configuration_path)
+    lr = config.lr
+    epochs = config.epochs
+    lambda_param = config.lambda_param
+    lambda_ident = config.lambda_ident
+    buffer_size = config.buffer_size
 
     if not torch.cuda.is_available():
         raise RuntimeError("Cuda not available")
@@ -508,10 +535,10 @@ def train_model(
         os.path.join(dataset_name, "trainB"), device
     ) as train_dataset_B:
         train_dataloader_A = DataLoader(
-            train_dataset_A, batch_size, shuffle=True, collate_fn=custom_collate
+            train_dataset_A, shuffle=True, collate_fn=custom_collate
         )
         train_dataloader_B = DataLoader(
-            train_dataset_B, batch_size, shuffle=True, collate_fn=custom_collate
+            train_dataset_B, shuffle=True, collate_fn=custom_collate
         )
 
         generator_A = Resnet_k(9).to(device)
@@ -570,6 +597,8 @@ def train_model(
 
         generator_A.train()
         generator_B.train()
+        discriminator_A.train()
+        discriminator_B.train()
 
         scaler = torch.cuda.amp.grad_scaler.GradScaler()
 
@@ -652,14 +681,14 @@ def train_model(
             for x_A, x_B in tqdm.tqdm(zip_long(train_dataloader_A, train_dataloader_B)):
                 generator_optimizer.zero_grad(set_to_none=True)
                 #
+                discriminator_A.requires_grad_(False)
+                discriminator_B.requires_grad_(False)
+                #
                 with torch.autocast(device_type=device.type, dtype=torch.float16):
                     # Generate images
                     fake_A: torch.Tensor = generator_A(x_B)
                     fake_B: torch.Tensor = generator_B(x_A)
                     # Generator loss
-                    discriminator_A.requires_grad_(False)
-                    discriminator_B.requires_grad_(False)
-                    #
                     gen_loss = generator_loss(
                         x_A,
                         x_B,
@@ -764,6 +793,14 @@ def main():
         help="where to store the model checkpoints",
     )
     parser.add_argument(
+        "-cfg",
+        "--configuration-path",
+        dest="config_path",
+        type=str,
+        default="./config.json",
+        help="path to the configuration file",
+    )
+    parser.add_argument(
         "-r",
         "--resume",
         dest="resume",
@@ -794,6 +831,7 @@ def main():
     train_model(
         args.dataset_name,
         args.checkpoint_dir,
+        args.config_path,
         args.resume,
         args.compile_model,
         args.compile_mode,
